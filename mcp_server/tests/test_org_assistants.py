@@ -167,6 +167,147 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(bool(m["main"] and m["main"]["pid"] == pid(uid))
                              for m in again["members"]), 1)
 
+    async def test_owner_placement_joins_live_assistant_or_worker_and_retries(self):
+        await self.members()
+        for n, role in enumerate(("assistant", "worker"), 1):
+            existing, fresh = uid_at(4, 70 + n), uid_at(0.01, 80 + n)
+            rows = [{"uid": existing, "ws": f"shared-{n}", "path": f"/w/shared-{n}",
+                     "member_id": self.ids["org"], "acting_as": role},
+                    {"uid": fresh, "ws": f"shared-{n}", "path": f"/w/shared-{n}",
+                     "name": f"owner-new-{n}", "auto_place_owner": True}]
+            reply = await self.beat(D1, rows)
+            self.assertEqual(reply["org"]["assignments"][fresh], self.ids["org"])
+            self.assertEqual(reply["org"]["auto_placed"][0]["acting_as"], "assistant")
+            again = await self.beat(D1, rows)
+            self.assertEqual(again["org"]["auto_placed"], [])
+            self.assertEqual(again["org"]["assignments"][fresh], self.ids["org"])
+            async with self.pool.acquire() as conn:
+                fact = await conn.fetchrow("SELECT * FROM org_session_facts WHERE pid = $1", pid(fresh))
+                self.assertFalse(fact["auto_place_owner"])
+                self.assertTrue(fact["assignment_authoritative"])
+                self.assertEqual(await conn.fetchval(
+                    "SELECT count(*) FROM incarnations WHERE pid = $1 AND ended_at IS NULL", pid(fresh)), 0)
+
+    async def test_owner_placement_uses_oldest_member_and_central_stream_mark(self):
+        await self.members()
+        older, newer, fresh = uid_at(8, 71), uid_at(1, 72), uid_at(0.01, 73)
+        reply = await self.beat(D1, [
+            {"uid": newer, "ws": "shared", "member_id": self.ids["org"], "acting_as": "assistant"},
+            {"uid": older, "ws": "shared", "member_id": self.ids["swarm-coord"], "acting_as": "worker"},
+            {"uid": fresh, "ws": "shared", "name": "join-oldest", "auto_place_owner": True}])
+        self.assertEqual(reply["org"]["assignments"][fresh], self.ids["swarm-coord"])
+        mark_body = {"actor": OWNER, "member": self.ids["org"], "daemon_id": D1,
+                     "workspace_id": "mark-only", "path": "/w/mark-only", "kind": "stream",
+                     "reason": "test", "request_id": "mark-only"}
+        marked = await self.http.post("/org/repair/workspace-mark", json=mark_body)
+        self.assertEqual(marked.status_code, 200, marked.text)
+        marked_fresh = uid_at(0.01, 74)
+        reply = await self.beat(D1, [{"uid": marked_fresh, "ws": "mark-only", "name": "join-mark",
+                                      "auto_place_owner": True}])
+        self.assertEqual(reply["org"]["assignments"][marked_fresh], self.ids["org"])
+
+    async def test_owner_placement_never_gives_home_with_unattributed_live_session(self):
+        shell, fresh = uid_at(2, 81), uid_at(0.01, 82)
+        await self.beat(D1, [{"uid": shell, "engine": "bash", "ws": "shared"},
+                             {"uid": fresh, "name": "new-home-test", "ws": "shared",
+                              "auto_place_owner": True}])
+        member = (await self.http.get("/org/members/main/new-home-test")).json()["member"]
+        self.assertIsNone(member["home_workspace"])
+
+    async def test_owner_placement_joins_a_vacant_members_live_assistant_by_path(self):
+        await self.members()
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET status = 'vacant' WHERE id = $1", self.ids["org"])
+            await conn.execute("UPDATE incarnations SET ended_at = now() WHERE member_id = $1", self.ids["org"])
+        assistant, fresh = uid_at(2, 83), uid_at(0.01, 84)
+        reply = await self.beat(D1, [
+            {"uid": assistant, "ws": "ws-a", "path": "/w/vacant", "member_id": self.ids["org"],
+             "acting_as": "assistant"},
+            {"uid": fresh, "ws": "ws-b", "path": "/w/vacant", "name": "vacant-join",
+             "auto_place_owner": True}])
+        self.assertEqual(reply["org"]["assignments"][fresh], self.ids["org"])
+
+    async def test_owner_repair_reassigns_and_pushes_stream_idempotently(self):
+        await self.members()
+        fresh = uid_at(0.01, 91)
+        row = {"uid": fresh, "name": "accidental-member", "ws": "bad-home", "path": "/w/bad-home",
+               "auto_place_owner": True}
+        reply = await self.beat(D1, [row])
+        source = reply["org"]["auto_placed"][0]["member_id"]
+        repair = {"actor": OWNER, "member": source, "destination": self.ids["org"],
+                  "reason": "repair placement", "request_id": "repair-source"}
+        refused = await self.http.post("/org/repair/auto-placed-assistant", json={
+            **repair, "actor": {"pid": pid(self.lane)}})
+        self.assertEqual(refused.status_code, 403, refused.text)
+        first = await self.http.post("/org/repair/auto-placed-assistant", json=repair)
+        self.assertEqual(first.status_code, 200, first.text)
+        again = await self.http.post("/org/repair/auto-placed-assistant", json=repair)
+        self.assertEqual(first.json(), again.json())
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT status FROM members WHERE id = $1", source), "retired")
+            self.assertEqual(await conn.fetchval("SELECT end_reason FROM incarnations WHERE member_id = $1", source),
+                             "repair placement")
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM org_events WHERE request_id = $1", "repair-source"), 2)
+            old_mark_id = await conn.fetchval("SELECT id FROM org_workspace_marks WHERE member_id = $1", source)
+        mark = {"actor": OWNER, "member": self.ids["org"], "daemon_id": D1, "workspace_id": "bad-home",
+                "kind": "stream", "reason": "restore stream", "request_id": "repair-mark"}
+        refused = await self.http.post("/org/repair/workspace-mark", json={
+            **mark, "actor": {"pid": pid(self.lane)}})
+        self.assertEqual(refused.status_code, 403, refused.text)
+        marked = await self.http.post("/org/repair/workspace-mark", json=mark)
+        self.assertEqual(marked.status_code, 200, marked.text)
+        replay = await self.http.post("/org/repair/workspace-mark", json=mark)
+        self.assertEqual(marked.json(), replay.json())
+        self.assertNotEqual(marked.json()["id"], old_mark_id)
+        reply = await self.beat(D1, [row], capabilities=["org_marks_v1"], acked_mark_ids=[old_mark_id])
+        self.assertEqual(reply["org"]["assignments"][fresh], self.ids["org"])
+        pushed = next(m for m in reply["org"]["workspace_marks"] if m["workspace_id"] == "bad-home")
+        self.assertEqual((pushed["kind"], pushed["member_id"]), ("stream", self.ids["org"]))
+        self.assertEqual(pushed["path"], "/w/bad-home")
+
+    async def test_repair_refuses_non_auto_placed_and_member_with_holds(self):
+        await self.members()
+        repair = {"actor": OWNER, "member": self.ids["org"], "destination": self.ids["swarm-coord"],
+                  "reason": "test", "request_id": "not-auto"}
+        response = await self.http.post("/org/repair/auto-placed-assistant", json=repair)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "not_auto_placed")
+        uid = uid_at(0.01, 92)
+        result = await self.beat(D1, [{"uid": uid, "name": "held-auto", "ws": "held",
+                                       "auto_place_owner": True}])
+        source = result["org"]["auto_placed"][0]["member_id"]
+        await self.board_with_holder(await self.task("held task"), pid(uid))
+        response = await self.http.post("/org/repair/auto-placed-assistant", json={
+            **repair, "member": source, "request_id": "has-holds"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "has_holds")
+
+    async def test_repair_refuses_reports_team_lead_and_other_live_assistants(self):
+        await self.members()
+        uid = uid_at(0.01, 93)
+        result = await self.beat(D1, [{"uid": uid, "name": "guarded-auto", "ws": "guarded",
+                                       "auto_place_owner": True}])
+        source = result["org"]["auto_placed"][0]["member_id"]
+        body = {"actor": OWNER, "member": source, "destination": self.ids["swarm-coord"],
+                "reason": "test guard", "request_id": "guarded-repair"}
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET manager_member_id = $1 WHERE id = $2", source, self.ids["org"])
+        response = await self.http.post("/org/repair/auto-placed-assistant", json=body)
+        self.assertEqual(response.json()["detail"]["code"], "has_reports")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET manager_member_id = $1 WHERE id = $2", self.ids["swarm-coord"], self.ids["org"])
+            team = await conn.fetchval("SELECT id FROM initiatives WHERE lead_member_id = $1 LIMIT 1", self.ids["swarm-coord"])
+            await conn.execute("UPDATE initiatives SET lead_member_id = $1 WHERE id = $2", source, team)
+        response = await self.http.post("/org/repair/auto-placed-assistant", json=body)
+        self.assertEqual(response.json()["detail"]["code"], "leads_team")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE initiatives SET lead_member_id = $1 WHERE id = $2", self.ids["swarm-coord"], team)
+        helper = uid_at(1, 94)
+        await self.beat(D1, [{"uid": uid, "name": "guarded-auto", "ws": "guarded", "auto_place_owner": True},
+                             {"uid": helper, "member_id": source, "acting_as": "assistant"}])
+        response = await self.http.post("/org/repair/auto-placed-assistant", json=body)
+        self.assertEqual(response.json()["detail"]["code"], "has_sessions")
+
     async def test_close_authority_main_chain_and_owner_allowed_others_refused(self):
         await self.members()
         # Refused: an unrelated member (the continuous one), the assistant

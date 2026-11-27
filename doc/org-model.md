@@ -134,12 +134,25 @@ Members are created deliberately and rarely. Everything else is an assistant.
 | Continuous scheduler respawn | new main session of the continuous member (§9.1) |
 | Revive, A-R, Alt+s Resume, daemon/brain restart | same uid, same occupancy row; nothing changes |
 | Any other agent spawn: plain `start_session`, `isolated=true`, `create_subtask` + spawn, `fork_session` without `hire`, `item_resolve(launch)`, `start_session(task_id=…)` | assistant of the caller's member, durable like a main session (§4.3). `isolated=true` (or `create_subtask` branch mode) gives it its own checkout, recorded as a `stream` workspace of the member's office. A spawn by a session that belongs to no member keeps today's **ephemeral** workspace |
-| Owner A-s (add a fresh agent session to a workspace) | auto-placed as a new member under Owner; shell, continuous and workflow rows remain excluded |
+| Owner A-s (add a fresh agent session to a workspace) | assistant of the workspace's member when the API sees a live member session or a central home/stream mark there; otherwise a new member under Owner. Shell, continuous and workflow rows remain excluded |
 | Owner A-F fork | assistant of the source's member unless Owner ticks "new member" |
 | Any agent spawn by a continuous member's session (its orchestrator, or anything that orchestrator spawned) | a **worker** of that member: stamped for attribution only, never durable. `mark_subtask_done`, the terminal sweep and the reaper treat it exactly as today, and its checkout is never promoted to `stream` (Swarm-Coord, 2026-10-25: continuous hosts run near their worktree cap and triage close-out reclaims checkouts) |
-| A fresh top-level agent session spawned by the TUI/operator (no spawner) | automatically a new `agent` member under Owner; Owner may move it later. Placement is durable across an API outage and does not apply to restores/resumes |
+| A fresh top-level agent session spawned by the TUI/operator (no spawner) | joins an API-visible workspace member as an assistant, or otherwise becomes a new `agent` member under Owner. Placement is durable across an API outage and does not apply to restores/resumes |
 | A restored/resumed session with no spawner | not a new hire; its existing member/assistant identity is preserved |
 | Bash sessions, backtest watch views, cloud dispatch workers | not members and never assistants. Bash/watch views belong to the workspace's member for display only, and only Owner closes, kills or restarts a shell. Cloud workers stay as today (§9.4) |
+
+For A-s, the API matches workspace ID or checkout path on the same daemon.
+Among live agent sessions belonging to different members it chooses the earliest
+spawned session's member; otherwise it uses a central home/stream mark. A new
+member is never given a home if another live session fact or central mark is
+present on that workspace or checkout. The daemon currently does not report
+local workspace marks: an `office_of`-only workspace with no live sessions
+and no central mark looks unowned until a future daemon reports those marks.
+
+Owner can repair an auto-placed member via `POST /org/repair/auto-placed-assistant`;
+it refuses members with reports, team leads, item holds, or other live
+assistants/workers. `POST /org/repair/workspace-mark` queues a home/stream mark.
+Both require a reason and request ID, record org events and replay requests.
 
 A live assistant can be reassigned with `org(action="reassign", session=uid,
 member=handle, reason=...)`. Its eligible live spawn descendants on that host

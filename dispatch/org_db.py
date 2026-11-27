@@ -903,22 +903,47 @@ async def _auto_place_home(conn, session: dict | None) -> dict | None:
     mark = await conn.fetchrow(
         """SELECT kind, member_id FROM org_workspace_marks
             WHERE daemon_id = $1 AND workspace_id = $2""", daemon_id, workspace_id)
-    if mark and (mark["kind"] == "home" or mark["member_id"]):
+    if mark:
         return None
     if path and await conn.fetchval(
             """SELECT 1 FROM org_workspace_marks
-                WHERE daemon_id = $1 AND path = $2 AND member_id IS NOT NULL
+                WHERE daemon_id = $1 AND path = $2
                 LIMIT 1""", daemon_id, path):
         return None
     if await conn.fetchval(
             """SELECT 1 FROM org_session_facts f
                  JOIN session_states s ON s.pid = f.pid
-                 JOIN incarnations i ON i.pid = f.pid AND i.ended_at IS NULL
                 WHERE s.daemon_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
+                  AND f.pid <> $4
                   AND (f.workspace_id = $2 OR ($3::text IS NOT NULL AND f.worktree_path = $3))
-                LIMIT 1""", daemon_id, workspace_id, path):
+                LIMIT 1""", daemon_id, workspace_id, path, session["pid"]):
         return None
     return home
+
+
+async def _workspace_member(conn, session: dict) -> str | None:
+    """Resolve a fresh session's workspace using live facts, then central marks."""
+    home = _home_of(session)
+    if not home:
+        return None
+    daemon_id, ws, path = home["daemon_id"], home["workspace_id"], home.get("path")
+    rows = await conn.fetch(
+        """SELECT f.session_uid, coalesce(i.member_id, f.member_id) AS member_id
+             FROM org_session_facts f JOIN session_states s ON s.pid = f.pid
+             LEFT JOIN incarnations i ON i.pid = f.pid AND i.role = 'main' AND i.ended_at IS NULL
+             JOIN members m ON m.id = coalesce(i.member_id, f.member_id)
+            WHERE f.daemon_id = $1 AND f.pid <> $4 AND s.exited_at IS NULL AND s.state <> 'exited'
+              AND s.engine = ANY($5::text[]) AND m.status <> 'retired'
+              AND (i.member_id IS NOT NULL OR f.acting_as IN ('assistant', 'worker'))
+              AND (f.workspace_id = $2 OR ($3::text IS NOT NULL AND f.worktree_path = $3))""",
+        daemon_id, ws, path, session["pid"], sorted(AGENT_ENGINES))
+    if rows:
+        return min(rows, key=lambda r: (spawn_order(r["session_uid"]), r["session_uid"]))["member_id"]
+    return await conn.fetchval(
+        """SELECT w.member_id FROM org_workspace_marks w JOIN members m ON m.id = w.member_id
+            WHERE w.daemon_id = $1 AND m.status <> 'retired'
+              AND (w.workspace_id = $2 OR ($3::text IS NOT NULL AND w.path = $3))
+            ORDER BY (w.workspace_id = $2) DESC, w.id LIMIT 1""", daemon_id, ws, path)
 
 
 async def _create_team(conn, actor, *, name, slug=None, kind="team", parent_team_id=None,
@@ -1837,6 +1862,103 @@ async def _member_write(pool, actor, request_id, method, body) -> dict:
         return response
 
 
+async def repair_auto_placed(pool, actor: dict, *, member: str, destination: str,
+                             reason: str, request_id: str) -> dict:
+    """Convert an auto-placed main into an assistant; refuse dependent work."""
+    _require_owner(actor, "repairing an auto-placed member")
+    if not reason or not reason.strip() or not request_id:
+        raise _err(422, "invalid_field", "reason and request_id are required")
+
+    async def body(conn):
+        source = await _resolve_member_id(conn, member)
+        target = await _resolve_member_id(conn, destination)
+        row = await conn.fetchrow("SELECT * FROM members WHERE id = $1", source) if source else None
+        if not row or row["status"] != "active" or row["kind"] != "agent":
+            raise _err(409, "invalid_member", "source must be an active agent member")
+        if not target or target == source or not await conn.fetchval(
+                "SELECT 1 FROM members WHERE id = $1 AND status <> 'retired' AND kind IN ('agent', 'continuous')", target):
+            raise _err(422, "unknown_member", "destination must be a different non-retired member")
+        if not await conn.fetchval(
+                """SELECT 1 FROM org_events WHERE subject_type = 'member' AND subject_id = $1
+                     AND type = 'hire' AND new->>'via' = 'auto_place'""", source):
+            raise _err(409, "not_auto_placed", "source was not auto-placed")
+        if await conn.fetchval("SELECT 1 FROM members WHERE manager_member_id = $1 AND status <> 'retired'", source):
+            raise _err(409, "has_reports", "source has reports")
+        if await conn.fetchval("SELECT 1 FROM initiatives WHERE lead_member_id = $1", source):
+            raise _err(409, "leads_team", "source leads a team")
+        main = await conn.fetchrow(
+            """SELECT i.* FROM incarnations i JOIN session_states s ON s.pid = i.pid
+                WHERE i.member_id = $1 AND i.role = 'main' AND i.ended_at IS NULL
+                  AND s.exited_at IS NULL AND s.state <> 'exited'""", source)
+        if not main:
+            raise _err(409, "no_live_main", "source has no live main session")
+        if await conn.fetchval(
+                """SELECT 1 FROM item_holders h WHERE h.pid = $2
+                      OR h.pid IN (SELECT pid FROM org_session_facts WHERE member_id = $1)
+                      OR h.pid IN (SELECT pid FROM incarnations WHERE member_id = $1)""",
+                source, main["pid"]):
+            raise _err(409, "has_holds", "source sessions hold items")
+        if await conn.fetchval(
+                """SELECT 1 FROM org_session_facts f JOIN session_states s ON s.pid = f.pid
+                    WHERE f.member_id = $1 AND f.pid <> $2 AND f.acting_as IN ('assistant', 'worker')
+                      AND s.exited_at IS NULL AND s.state <> 'exited'""", source, main["pid"]):
+            raise _err(409, "has_sessions", "source has other live assistants or workers")
+        await conn.execute("UPDATE incarnations SET ended_at = now(), end_reason = $2 WHERE id = $1",
+                           main["id"], reason)
+        updated = await conn.fetchval(
+            """UPDATE org_session_facts SET member_id = $2, acting_as = 'assistant',
+                      assignment_authoritative = TRUE, auto_place_owner = FALSE
+                WHERE pid = $1 RETURNING pid""", main["pid"], target)
+        if not updated:
+            raise _err(409, "missing_facts", "main session has no org facts")
+        await conn.execute(
+            """UPDATE members SET status = 'retired', retired_at = now(), revision = revision + 1,
+                       defaults = defaults - 'home_workspace', updated_at = now() WHERE id = $1""", source)
+        await _event(conn, "member", source, "retire", actor,
+                     prev={"status": row["status"], "pid": main["pid"]},
+                     new={"status": "retired", "assistant_of": target}, reason=reason, request_id=request_id)
+        await _event(conn, "member", target, "assistant_reassigned", actor,
+                     prev={"pid": main["pid"], "member_id": source, "acting_as": "main"},
+                     new={"pid": main["pid"], "member_id": target, "acting_as": "assistant"},
+                     reason=reason, request_id=request_id)
+        await conn.execute("SELECT org_changes_note('member', $1, 'upsert')", target)
+        return {"member_id": source, "destination": target, "pid": main["pid"],
+                "session_uid": main["session_uid"], "acting_as": "assistant"}
+
+    return await _member_write(pool, actor, request_id, "repair_auto_placed", body)
+
+
+async def set_workspace_mark(pool, actor: dict, *, member: str, daemon_id: str, workspace_id: str,
+                             kind: str, path: str | None, reason: str, request_id: str) -> dict:
+    """Owner repairs a central workspace mark and queues it for the daemon."""
+    _require_owner(actor, "repairing a workspace mark")
+    if kind not in ("home", "stream") or not reason or not reason.strip() or not request_id:
+        raise _err(422, "invalid_field", "kind, reason and request_id are required")
+
+    async def body(conn):
+        member_id = await _resolve_member_id(conn, member)
+        if not member_id or not await conn.fetchval(
+                "SELECT 1 FROM members WHERE id = $1 AND status <> 'retired'", member_id):
+            raise _err(422, "unknown_member", "member must not be retired")
+        previous = await conn.fetchrow(
+            "SELECT * FROM org_workspace_marks WHERE daemon_id = $1 AND workspace_id = $2", daemon_id, workspace_id)
+        # Acks carry only the mark id, not a revision. Give a repair a new id
+        # so an in-flight ack of the previous mark cannot confirm this one.
+        if previous:
+            await conn.execute("DELETE FROM org_workspace_marks WHERE id = $1", previous["id"])
+        mark = await conn.fetchrow(
+            """INSERT INTO org_workspace_marks (daemon_id, workspace_id, path, kind, member_id)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING *""", daemon_id, workspace_id,
+            path if path is not None else (previous["path"] if previous else None), kind, member_id)
+        await _event(conn, "workspace", f"{daemon_id}:{workspace_id}", "workspace_mark_set", actor,
+                     prev=dict(previous) if previous else None, new=dict(mark),
+                     reason=reason, request_id=request_id)
+        return _json_safe(dict(mark))
+
+    return await _member_write(pool, actor, request_id, "set_workspace_mark", body)
+
+
 async def retire(pool, actor: dict, ref: str, *, reason: str, request_id: str | None = None) -> dict:
     """Mark a member retired: Owner, or an active member up its manager chain.
 
@@ -2334,6 +2456,20 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                 taken = {r["alias"] for r in await conn.fetch(
                     "SELECT alias FROM member_aliases WHERE org_id = $1", ORG)}
                 for row in candidates:
+                    member_id = (await _workspace_member(conn, dict(row))
+                                 if row["pid"] not in unresolved else None)
+                    if member_id:
+                        await conn.execute(
+                            """UPDATE org_session_facts SET member_id = $2, acting_as = 'assistant',
+                                      assignment_authoritative = TRUE, auto_place_owner = FALSE
+                                WHERE pid = $1""", row["pid"], member_id)
+                        await _event(conn, "member", member_id, "assistant_joined", {"pid": OWNER_PID},
+                                     new={"pid": row["pid"], "via": "auto_place"},
+                                     request_id=f"auto-place:{row['pid']}")
+                        await conn.execute("SELECT org_changes_note('member', $1, 'upsert')", member_id)
+                        auto_placed.append({"pid": row["pid"], "member_id": member_id,
+                                            "acting_as": "assistant"})
+                        continue
                     base = normalize_handle(row["name"]) or normalize_handle(row["session_uid"]) or "agent"
                     handle = _free_handle(base, taken)
                     taken.add(handle)

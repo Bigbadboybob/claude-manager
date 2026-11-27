@@ -512,9 +512,9 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
              "auto_place_owner": True},
         ])
         self.assertEqual(len(reply["org"]["auto_placed"]), 1)
-        new_member = (await self.http.get("/org/members/main/new-agent")).json()["member"]
         existing_member = (await self.http.get("/org/members/main/existing")).json()["member"]
-        self.assertIsNone(new_member["home_workspace"])
+        self.assertEqual(reply["org"]["auto_placed"][0]["acting_as"], "assistant")
+        self.assertEqual(reply["org"]["assignments"][fresh], existing_member["id"])
         self.assertEqual(existing_member["home_workspace"]["workspace_id"], "ws-home")
 
     async def test_auto_place_heartbeat_waits_for_feed_lock_without_lock_cycle(self):

@@ -99,6 +99,25 @@ class ReassignBody(_Strict):
     request_id: RequestId | None = None
 
 
+class RepairAutoPlacedBody(_Strict):
+    actor: Actor
+    member: Short
+    destination: Short
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId
+
+
+class WorkspaceMarkBody(_Strict):
+    actor: Actor
+    member: Short
+    daemon_id: Annotated[str, Field(min_length=1, max_length=200)]
+    workspace_id: Annotated[str, Field(min_length=1, max_length=200)]
+    path: Annotated[str, Field(max_length=1000)] | None = None
+    kind: str = Field(pattern=r"^(home|stream)$")
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId
+
+
 class MoveBody(_Strict):
     actor: Actor
     manager: Short | None = None
@@ -327,6 +346,21 @@ async def promote_assistant(body: PromoteBody, request: Request):
         _pool(request), body.actor.model_dump(), pid=body.pid, handle=body.handle,
         title=body.title, team=body.team, manager=body.manager, reason=body.reason,
         home_refused=body.home_refused, request_id=body.request_id, with_subtree=body.with_subtree, expected_sessions=body.expected_sessions))
+
+
+@router.post("/repair/auto-placed-assistant")
+async def repair_auto_placed_assistant(body: RepairAutoPlacedBody, request: Request):
+    return await _call(org_db.repair_auto_placed(
+        _pool(request), body.actor.model_dump(), member=body.member, destination=body.destination,
+        reason=body.reason, request_id=body.request_id))
+
+
+@router.post("/repair/workspace-mark")
+async def repair_workspace_mark(body: WorkspaceMarkBody, request: Request):
+    return await _call(org_db.set_workspace_mark(
+        _pool(request), body.actor.model_dump(), member=body.member, daemon_id=body.daemon_id,
+        workspace_id=body.workspace_id, path=body.path, kind=body.kind,
+        reason=body.reason, request_id=body.request_id))
 
 
 @router.post("/assistants/reassign")
