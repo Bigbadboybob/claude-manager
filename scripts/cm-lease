@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -62,6 +63,23 @@ def drain_ignore_datadirs(cfg):
             not path or '\0' in path or not os.path.isabs(path) for path in ignored)):
         raise Refused('drain_ignore_datadirs must be a list of absolute paths')
     return ignored
+
+
+def disk_policy(cfg):
+    result = {}
+    for key, default in (('owner_dir_cap_gb', 20), ('min_free_gb', 15)):
+        value = cfg.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise Refused(f'{key} must be a positive integer')
+        result[key] = value
+    return result
+
+
+def require_free_space(cfg):
+    floor = disk_policy(cfg)['min_free_gb'] * 1024 ** 3
+    free = shutil.disk_usage('/home').free
+    if free < floor:
+        raise Refused(f'insufficient free space on /home: {free} bytes available; minimum {floor}')
 
 
 def workdir_root(cfg):
@@ -197,6 +215,7 @@ def expiry(value, cfg):
 
 
 def grant(args, cfg):
+    require_free_space(cfg)
     if args.slots <= 0 or args.mem_gb <= 0:
         raise Refused('slots and memory must be positive')
     if args.mem_gb > args.slots * cfg['mem_gb_per_slot']:

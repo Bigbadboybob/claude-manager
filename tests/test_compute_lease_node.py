@@ -33,6 +33,7 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr(node, 'LOG', tmp_path / 'audit.log')
     monkeypatch.setattr(node.time, 'time', lambda: 1000)
     monkeypatch.setattr(node.os, 'chown', lambda *args: None)
+    monkeypatch.setattr(node.shutil, 'disk_usage', lambda path: SimpleNamespace(free=100 * 1024 ** 3))
     monkeypatch.setattr(node.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=1, pw_gid=1))
     def make_workdir(path, owner, ident, expires, user):
         path.mkdir()
@@ -48,6 +49,25 @@ def context(tmp_path, monkeypatch):
     args = SimpleNamespace(lease_id=LEASE, owner='agent:daemon:session', slots=1,
                            mem_gb=16, pin=None, expires_epoch=2000)
     return cfg, args, calls
+
+
+@pytest.mark.parametrize('key,bad', [('min_free_gb', 0), ('min_free_gb', True),
+                                      ('owner_dir_cap_gb', '20'), ('owner_dir_cap_gb', -1)])
+def test_invalid_disk_policy_refuses_grant_but_not_release(context, key, bad):
+    cfg, args, _ = context
+    node.grant(args, cfg)
+    cfg[key] = bad
+    with pytest.raises(node.Refused, match=key):
+        node.grant(args, cfg)
+    assert node.release(LEASE, cfg)['released']
+
+
+def test_grant_refuses_low_free_disk(context, monkeypatch):
+    cfg, args, _ = context
+    monkeypatch.setattr(node.shutil, 'disk_usage', lambda path: SimpleNamespace(free=14 * 1024 ** 3))
+    with pytest.raises(node.Refused, match='insufficient free space'):
+        node.grant(args, cfg)
+    assert node.load(LEASE) is None
 
 
 def test_grant_is_idempotent_and_loose_limits_memory_only(context):
