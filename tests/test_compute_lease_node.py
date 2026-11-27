@@ -57,8 +57,10 @@ def test_invalid_disk_policy_refuses_grant_but_not_release(context, key, bad):
     cfg, args, _ = context
     node.grant(args, cfg)
     cfg[key] = bad
+    other = SimpleNamespace(**vars(args))
+    other.lease_id = '00000000-0000-4000-8000-000000000001'
     with pytest.raises(node.Refused, match=key):
-        node.grant(args, cfg)
+        node.grant(other, cfg)
     assert node.release(LEASE, cfg)['released']
 
 

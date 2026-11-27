@@ -215,7 +215,6 @@ def expiry(value, cfg):
 
 
 def grant(args, cfg):
-    require_free_space(cfg)
     if args.slots <= 0 or args.mem_gb <= 0:
         raise Refused('slots and memory must be positive')
     if args.mem_gb > args.slots * cfg['mem_gb_per_slot']:
@@ -239,6 +238,8 @@ def grant(args, cfg):
             result = release(args.lease_id, cfg)
             return {**result, 'expired': True}
         return {'lease_id': args.lease_id, 'expired': True, 'released': True}
+    if not old:
+        require_free_space(cfg)
     root = workdir_root(cfg)
     expiry(args.expires_epoch, cfg)
     if old:
