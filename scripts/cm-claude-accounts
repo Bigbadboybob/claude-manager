@@ -1415,17 +1415,114 @@ DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
 USAGE_INTERVAL_SECONDS = 9 * 60
 NEAR_LIMIT_PERCENT = 95
 NEAR_LIMIT_INTERVAL_SECONDS = 170  # every other 2-min timer run: ~0.7% at 10%/h
+USAGE_RISK_MARGIN_PERCENT = 2.0
+DEFAULT_BURN_RATE_PER_HOUR = {"session": 60.0, "weekly": 15.0}
 
 
-def near_switch_point(state: dict, reading: dict, now: float) -> bool:
-    """A limit between 95% and its switch point that has not reset: read
-    more often so the switch lands in time. Past the switch point fresh
-    numbers change nothing (claudelb-local, 11-15)."""
-    policy = (last_hub_reply(state) or {}).get("policy") or {}
-    config = {"thresholds": policy.get("thresholds") or (state.get("config") or {}).get("thresholds") or {}}
-    return any(NEAR_LIMIT_PERCENT <= l.get("percent", 0) < threshold_for(l, config)
-               for l in reading.get("limits") or []
-               if not (l.get("resets_at") is not None and l["resets_at"] <= now))
+def conservative_projection(limit: dict, horizon: float) -> float | None:
+    percent = limit.get("percent")
+    if not isinstance(percent, (int, float)):
+        return None
+    family = "session" if limit.get("kind") == "session" else "weekly"
+    return percent + DEFAULT_BURN_RATE_PER_HOUR[family] * max(0, horizon) / 3600
+
+
+def usage_interval_seconds(state: dict) -> float:
+    interval = (state.get("config") or {}).get("usage_interval_minutes")
+    return interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
+
+
+def usage_threshold_config(state: dict, uuid: str | None = None,
+                           accounts: dict[str, dict] | None = None) -> dict:
+    """The threshold policy for one active account, including its override."""
+    config = dict(state.get("config") or {})
+    reply = last_hub_reply(state) or {}
+    policy = reply.get("policy") or {}
+    if policy:
+        config.update({k: policy[k] for k in ("thresholds", "switch_on_scoped") if k in policy})
+        email = None
+        if accounts and uuid in accounts:
+            email = (accounts[uuid].get("oauthAccount") or {}).get("emailAddress")
+        email = email or (reply.get("account_emails") or {}).get(uuid)
+        override = account_threshold(policy, email)
+        if override is not None:
+            config["account_threshold"] = override
+    return config
+
+
+def projected_usage(reading: dict | None, previous: dict | None, config: dict,
+                    now: float, horizon: float = 900) -> list[tuple[dict, float]]:
+    if not isinstance(reading, dict) or not isinstance(previous, dict):
+        return []
+    return projected_limits(reading, previous, config, now, horizon=horizon)
+
+
+def usage_risk_limits(reading: dict | None, previous: dict | None, config: dict,
+                      now: float, horizon: float = 900, failed: bool = False) -> list[dict]:
+    """Return limits that require a switch before the next usage poll.
+
+    A failed poll keeps the last reading, but a recent reading near the
+    threshold (or its burn-rate projection) is enough to act conservatively.
+    """
+    if not isinstance(reading, dict):
+        return []
+    limits = reading.get("limits") or []
+    out = list(over_threshold(limits, config, now, for_switch=True))
+    def key(limit: dict) -> tuple:
+        return limit.get("kind"), limit.get("scope"), limit.get("group")
+    out_keys = {key(limit) for limit in out}
+    projected = projected_usage(reading, previous, config, now, horizon=horizon)
+    projected_keys = {(l.get("kind"), l.get("scope"), l.get("group")) for l, _ in projected}
+    if failed:
+        for limit in limits:
+            if limit.get("kind") not in ("session", "weekly_all") and not config.get("switch_on_scoped"):
+                continue
+            if limit.get("resets_at") is not None and limit["resets_at"] <= now:
+                continue
+            limit_key = (limit.get("kind"), limit.get("scope"), limit.get("group"))
+            if limit_key not in projected_keys:
+                value = conservative_projection(limit, horizon)
+                if value is not None and value >= threshold_for(limit, config):
+                    projected.append((limit, value))
+    for limit, value in projected:
+        if value >= threshold_for(limit, config) and key(limit) not in out_keys:
+            out.append({**limit, "percent": max(limit.get("percent", 0), threshold_for(limit, config))})
+            out_keys.add(key(limit))
+    if failed:
+        for limit in limits:
+            if limit.get("kind") not in ("session", "weekly_all") and not config.get("switch_on_scoped"):
+                continue
+            reset = limit.get("resets_at")
+            if reset is not None and reset <= now:
+                continue
+            if isinstance(limit.get("percent"), (int, float)) \
+                    and limit["percent"] >= threshold_for(limit, config) - USAGE_RISK_MARGIN_PERCENT \
+                    and key(limit) not in out_keys:
+                out.append({**limit, "percent": threshold_for(limit, config)})
+                out_keys.add(key(limit))
+    return out
+
+
+def near_switch_point(state: dict, reading: dict, now: float, interval: float | None = None,
+                      accounts: dict[str, dict] | None = None) -> bool:
+    """Poll quickly when the current reading or burn-rate projection is near."""
+    interval = usage_interval_seconds(state) if interval is None else interval
+    uuid = state.get("active")
+    config = usage_threshold_config(state, uuid, accounts)
+    previous = (state.get("usage_previous") or {}).get(uuid)
+    for limit in reading.get("limits") or []:
+        reset = limit.get("resets_at")
+        threshold = threshold_for(limit, config)
+        if reset is not None and reset <= now:
+            continue
+        if limit.get("percent", 0) >= threshold - USAGE_RISK_MARGIN_PERCENT:
+            return True
+    if projected_usage(reading, previous, config, now, horizon=interval):
+        return True
+    return any((limit.get("resets_at") is None or limit["resets_at"] > now)
+               and (value := conservative_projection(limit, interval)) is not None
+               and value >= threshold_for(limit, config) - USAGE_RISK_MARGIN_PERCENT
+               for limit in reading.get("limits") or [])
 
 
 def fetch_usage(access_token: str) -> dict:
@@ -1738,7 +1835,8 @@ def export_view(paths: Paths, state: dict) -> dict:
             "sessions": state.get("sessions"),
             "last_switch_at": last_switch_at(state),
             "auto_switches_24h": auto_switches_since(state, now - 86400),
-            "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll}}
+            "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll},
+            "rate_limit_signal_at": state.get("rate_limit_signal_at")}
 
 
 def fetch_peer(host: str) -> dict:
@@ -1874,6 +1972,23 @@ def poll_skipped(state: dict, reason: str) -> int:
     return 0
 
 
+def cached_limits_after_poll_failure(state: dict, accounts: dict[str, dict], uuid: str | None,
+                                     now: float | None = None) -> list[dict] | None:
+    """Keep the switch path alive when usage reads are failing or backed off."""
+    if not uuid:
+        return None
+    reading = (state.get("usage") or {}).get(uuid)
+    if not isinstance(reading, dict) or not reading.get("limits"):
+        return None
+    now = time.time() if now is None else now
+    config = usage_threshold_config(state, uuid, accounts)
+    previous = (state.get("usage_previous") or {}).get(uuid)
+    if usage_risk_limits(reading, previous, config, now,
+                         horizon=usage_interval_seconds(state), failed=True):
+        return reading["limits"]
+    return None
+
+
 
 # --- post-switch sweep ----------------------------------------------------------------
 #
@@ -2006,6 +2121,8 @@ def sweep(paths: Paths, state: dict, out, alert, alert_owner) -> None:
             done[key] = now
             owner.append(f"{name} ({error})")
             continue
+        if error == "rate_limit":
+            state["rate_limit_signal_at"] = int(now)
         if len(prompted) >= SWEEP_MAX_PER_RUN:
             break
         try:
@@ -2499,8 +2616,12 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
         pending = next((uuid for uuid, meta in copies.items()
                         if meta.get("borrower") == host and meta.get("evicting")), None)
         must_switch = pending if pending == active else None
-        # A previously issued eviction remains in force if its reply was lost.
-        lend = pool_lend(hub, host, export, reports, now, previous) if not pending or copy_over else None
+        # A previously issued eviction remains in force if its reply was lost,
+        # but it must not prevent a replacement lend in this same check-in.
+        eviction_returns = {uuid for uuid in returned
+                            if (old_copies.get(uuid) or {}).get("borrower") == host
+                            and (old_copies.get(uuid) or {}).get("evicting")}
+        lend = pool_lend(hub, host, export, reports, now, previous, eviction_returns)
         if lend:
             reply["lend"] = lend
         elif must_switch or (pending and (reply.get("entry") or {}).get("mode") == "pin"
@@ -2768,6 +2889,7 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning,
             copy.update(borrower=None, fingerprint=fp)
             copy.pop("evicting", None)
             copy.pop("fallback", None)
+            copy.pop("lent_at", None)
             hub.save_copies(copies)
             ledger[fp] = {"account": uuid, "host": host, "at": int(time.time()), "slot": "copy"}
             atomic_write(hub.dir / "lent-logins.json", ledger)
@@ -2813,6 +2935,7 @@ def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
                     copy["borrower"] = None
                     copy.pop("evicting", None)
                     copy.pop("fallback", None)
+                    copy.pop("lent_at", None)
                     hub.save_copies(copies)
                     hub.event("pool", f"lend copy of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
             continue
@@ -2979,24 +3102,112 @@ def lend_copy_has_room(reading: dict | None, caps: dict | None, now: float) -> b
     return True
 
 
+def lend_copy_over_cap(reading: dict | None, caps: dict | None, now: float) -> bool:
+    """Return over-cap only when a complete, fresh usage reading proves it."""
+    if not isinstance(caps, dict) or not isinstance(reading, dict) \
+            or not isinstance(reading.get("at"), (int, float)) \
+            or now - reading["at"] > POOL_READING_STALE_SECONDS \
+            or reading["at"] > now:
+        return False
+    limits = {l.get("kind"): l for l in reading.get("limits", []) if isinstance(l, dict)}
+    checked = False
+    for kind, key in (("weekly_all", "week"), ("session", "five_hour")):
+        cap = caps.get(key)
+        if not isinstance(cap, (int, float)):
+            return False
+        limit = limits.get(kind)
+        if limit is None and kind == "session":
+            continue
+        if not isinstance(limit, dict):
+            return False
+        if limit.get("resets_at") is None or limit["resets_at"] > now:
+            checked = True
+            if isinstance(limit.get("percent"), (int, float)) and limit["percent"] >= cap:
+                return True
+    return False if checked else False
+
+
+def lend_copy_bound_over_cap(reading: dict | None, caps: dict | None,
+                            now: float, since: float) -> bool:
+    """Conservatively account for usage since a lender's fresh reading."""
+    if not isinstance(caps, dict) or not isinstance(reading, dict) \
+            or not isinstance(reading.get("at"), (int, float)) \
+            or reading["at"] > now or now - reading["at"] > POOL_READING_STALE_SECONDS:
+        return False
+    elapsed = max(0.0, now - max(reading["at"], since))
+    limits = {l.get("kind"): l for l in reading.get("limits", []) if isinstance(l, dict)}
+    for kind, key in (("weekly_all", "week"), ("session", "five_hour")):
+        cap = caps.get(key)
+        if not isinstance(cap, (int, float)):
+            return False
+        limit = limits.get(kind)
+        if limit is None and kind == "session":
+            continue
+        if not isinstance(limit, dict):
+            return False
+        if limit.get("resets_at") is not None and limit["resets_at"] <= now:
+            continue
+        projected = conservative_projection(limit, elapsed)
+        if projected is not None and projected >= cap:
+            return True
+    return False
+
+
 def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
                            reports: dict[str, dict], now: float) -> str | None:
-    """A missing or stale borrower reading also triggers a conservative eviction."""
+    """Evict only on a post-lend reading that proves the copy hit its cap.
+
+    A borrower can miss a usage poll while still having room.  The lender's
+    fresh post-lend reading is useful evidence, but readings from before the
+    lend are deliberately ignored.
+    """
     active = export.get("active")
-    if not active or (hub.copies().get(active) or {}).get("borrower") != host:
+    meta = hub.copies().get(active) or {}
+    if not active or meta.get("borrower") != host:
         return None
+    lent_at = meta.get("lent_at")
     info = (export.get("accounts") or {}).get(active) or {}
+    if not isinstance(lent_at, (int, float)):
+        fingerprint = info.get("login_fingerprint") or meta.get("fingerprint")
+        ledger = load_json(hub.dir / "lent-logins.json")
+        entry = ledger.get(fingerprint) if isinstance(fingerprint, str) else None
+        if isinstance(entry, dict) and entry.get("host") == host and entry.get("slot") == "copy":
+            lent_at = entry.get("at")
+    if not isinstance(lent_at, (int, float)):
+        return None
     email = info.get("email") or hub_emails(reports).get(active) or ""
     caps = (hub.desired["policy"].get("lend_caps") or {}).get(email.lower())
-    reading = info.get("reading") or {}
-    fresh = fresh_copy_readings(hub, reports, active, now)
-    if not lend_copy_has_room(reading, caps, now) or not fresh \
-            or any(not lend_copy_has_room(r, caps, now) for r in fresh):
+    borrower_reading = info.get("reading")
+    if lend_copy_over_cap(borrower_reading, caps, now) \
+            and borrower_reading.get("at", 0) >= lent_at:
+        return active
+    # The copy's lender may be the only host with a fresh reading.  A reading
+    # from before the lend says nothing about what the borrower consumed.
+    for report_host, report in reports.items():
+        if report_host in (POOL, host):
+            continue
+        account_info = host_accounts(report).get(active)
+        reading = account_info.get("reading") if isinstance(account_info, dict) else None
+        if not isinstance(reading, dict) or reading.get("at", 0) < lent_at:
+            continue
+        if lend_copy_over_cap(reading, caps, now):
+            return active
+        if lend_copy_bound_over_cap(reading, caps, now, lent_at):
+            return active
+    cached = load_json(hub.dir / "readings.json").get(active)
+    if isinstance(cached, dict) and cached.get("host") not in (None, host) \
+            and cached.get("at", 0) >= lent_at \
+            and lend_copy_over_cap(cached, caps, now) and cached.get("at", 0) >= lent_at:
+        return active
+    if isinstance(cached, dict) and cached.get("host") not in (None, host) \
+            and cached.get("at", 0) >= lent_at \
+            and lend_copy_bound_over_cap(cached, caps, now, lent_at):
         return active
     return None
 
 
-def projected_limits(reading: dict, previous: dict, config: dict, now: float) -> list[tuple[dict, float]]:
+def projected_limits(reading: dict, previous: dict, config: dict, now: float,
+                     horizon: float = 900) -> list[tuple[dict, float]]:
     """Project one observed reading interval ahead, only within a known reset window."""
     at, old_at = reading.get("at"), previous.get("at")
     if not (isinstance(at, (int, float)) and isinstance(old_at, (int, float))
@@ -3013,11 +3224,13 @@ def projected_limits(reading: dict, previous: dict, config: dict, now: float) ->
             continue
         old = old_limits.get((kind, limit.get("scope"), limit.get("group"))) or {}
         reset, percent, old_percent = limit.get("resets_at"), limit.get("percent"), old.get("percent")
+        old_reset = old.get("resets_at")
         if not (isinstance(kind, str) and isinstance(reset, (int, float)) and reset > now
-                and reset == old.get("resets_at") and isinstance(percent, (int, float))
+                and isinstance(old_reset, (int, float)) and abs(reset - old_reset) < 1
+                and isinstance(percent, (int, float))
                 and isinstance(old_percent, (int, float)) and percent >= old_percent):
             continue
-        projected = percent + (percent - old_percent) * min(at - old_at, 900) / (at - old_at)
+        projected = percent + (percent - old_percent) * min(max(0, horizon), at - old_at) / (at - old_at)
         if projected >= threshold_for(limit, config):
             result.append((limit, projected))
     return result
@@ -3049,6 +3262,44 @@ def pool_candidate_has_room(hub: Hub, host: str, candidate: str,
     return True
 
 
+def host_rate_limit_signal(export: dict, now: float) -> bool:
+    """A sweep's rate_limit errors are direct evidence the active login is full."""
+    signal_at = export.get("rate_limit_signal_at")
+    if isinstance(signal_at, (int, float)) and now - signal_at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS:
+        return True
+    for event in export.get("events") or []:
+        if not isinstance(event, dict) or "rate_limit" not in str(event.get("message", "")):
+            continue
+        at = event.get("at")
+        if not isinstance(at, (int, float)) or now - at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS:
+            return True
+    return False
+
+
+def usage_failure_limits(export: dict, previous: dict | None, config: dict,
+                         now: float) -> list[dict]:
+    """Hub-side equivalent of the host's failed-poll switch guard."""
+    active = export.get("active")
+    info = (export.get("accounts") or {}).get(active) or {}
+    reading = info.get("reading") if isinstance(info, dict) else None
+    old = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") \
+        if (previous or {}).get("active") == active else None
+    failed = (export.get("poll") or {}).get("ok") is False
+    limits = (usage_risk_limits(reading, old, config, now, failed=True)
+              if failed else over_threshold((reading or {}).get("limits") or [], config, now,
+                                            for_switch=True))
+    if limits:
+        return limits
+    if host_rate_limit_signal(export, now):
+        for limit in (reading or {}).get("limits", []):
+            if limit.get("kind") in ("session", "weekly_all") or config.get("switch_on_scoped"):
+                return [{**limit, "percent": threshold_for(limit, config)}]
+        return [{"kind": "session", "scope": None, "group": None,
+                 "percent": threshold_for({"kind": "session"}, config),
+                 "resets_at": None}]
+    return []
+
+
 def billing_host_suspect(export, now):
     active = export.get('active')
     switch_at = export.get('last_switch_at')
@@ -3067,11 +3318,34 @@ def billing_host_suspect(export, now):
     return True, f'usage poll 429 for {age} min'
 
 
+def available_lend_copy(hub: Hub, host: str, uuid: str,
+                        reports: dict[str, dict], now: float) -> bool:
+    meta = hub.copies().get(uuid) or {}
+    path = hub.copy_path(uuid)
+    if meta.get("borrower") or not path.exists() or copy_conflict_hosts(uuid, meta, reports):
+        return False
+    try:
+        record = load_json(path)
+    except (OSError, ValueError, AccountError):
+        return False
+    if not valid_login_record(record) or login_state(record, now) in ("needs /login", "login expired"):
+        return False
+    email = (record.get("oauthAccount") or {}).get("emailAddress") or ""
+    caps = (hub.desired["policy"].get("lend_caps") or {}).get(email.lower())
+    fresh = fresh_copy_readings(hub, reports, uuid, now)
+    if not fresh or any(not lend_copy_has_room(reading, caps, now) for reading in fresh):
+        return False
+    latest = latest_copy_readings(hub, reports, uuid)
+    return not (meta.get("blocked_at") is not None and latest
+                and latest[0].get("at", 0) <= meta["blocked_at"])
+
+
 def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float,
-              previous: dict | None = None) -> dict | None:
+              previous: dict | None = None, avoid: set[str] | None = None) -> dict | None:
     """Hand a pool login to a host that needs one: its pinned account, or in
     auto mode a fresh account once its own is over threshold."""
     entry = hub.desired["hosts"].get(host) or {}
+    avoid = avoid or set()
     active = export.get("active")
     held = set(export.get("accounts") or {}) | {active}
     pool = hub.pool()
@@ -3087,9 +3361,18 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         if not any(str(e.get('text', '')).startswith(f'{name} suspected past due') for e in recent):
             hub.event('billing', marker, host=host, at=int(now))
     if entry.get("mode") == "pin" and entry.get("account") not in (None, active) \
-            and entry["account"] not in held and entry["account"] in pool:
-        target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
-        if (billing_cache_load(hub).get(target) or {}).get('status') == 'blocked':
+            and entry["account"] not in held:
+        pinned = entry["account"]
+        if pinned in pool and pinned not in avoid:
+            target, reason = pinned, f"pinned (rev {hub.desired['revision']})"
+        elif pinned not in avoid and available_lend_copy(hub, host, pinned, reports, now):
+            usable_held = [uuid for uuid, info in (export.get("accounts") or {}).items()
+                           if isinstance(info, dict)
+                           and info.get("login") not in ("needs /login", "login expired")]
+            fallback = active if active in usable_held else next(iter(sorted(usable_held)), None)
+            if fallback:
+                target, reason = pinned + "~copy", f"pinned lend copy (rev {hub.desired['revision']})"
+        if target and (billing_cache_load(hub).get(target.removesuffix("~copy")) or {}).get('status') == 'blocked':
             target = None
     elif entry.get("mode") == "auto":
         policy = hub.desired["policy"]
@@ -3100,22 +3383,30 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         config["switch_on_scoped"] = config["switch_on_scoped"] \
             and host not in set(policy.get("leftover_hosts") or [])
         reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
+        old_reading = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") or {} \
+            if (previous or {}).get("active") == active else {}
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
+        failure_over = usage_failure_limits(export, previous, config, now) if active else []
+        for limit in failure_over:
+            if all(limit.get("kind") != old.get("kind") or limit.get("scope") != old.get("scope")
+                   or limit.get("group") != old.get("group") for old in over):
+                over.append(limit)
         res = hub.desired["reservations"].get(active) if active else None
         copy_borrowed = (copies.get(active) or {}).get("borrower") == host
         taken = bool(res and host not in res.get("for", []) and not res.get("last_resort")
                      and not copy_borrowed)
         copy_over = bool(borrowed_copy_over_cap(hub, host, export, reports, now))
-        old_reading = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") or {} \
-            if (previous or {}).get("active") == active else {}
+        evicting = bool(active and (copies.get(active) or {}).get("borrower") == host
+                        and (copies.get(active) or {}).get("evicting"))
         projected = projected_limits(reading, old_reading, config, now) if active else []
-        needs = not active or over or taken or copy_over or projected or suspect
+        needs = not active or over or taken or copy_over or projected or suspect or evicting
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
         switch_at = export.get("last_switch_at") or 0
         fresh_full = bool(over and switch_at and isinstance(reading.get("at"), (int, float))
                           and switch_at < reading["at"] <= now)
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
-        if needs and (((waited or fresh_full or suspect) and not capped) or copy_over):
+        if needs and (((waited or fresh_full or suspect or evicting) and not capped)
+                      or copy_over or evicting):
             cands = pool_candidates(hub, host, reports, now)
             if suspect:
                 cache = billing_cache_load(hub)
@@ -3131,9 +3422,10 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
                                and info.get("login") not in ("needs /login", "login expired")]
                 fallback = active if active in usable_held else next(iter(sorted(usable_held)), None)
                 cands = [c for c in cands if c[1].removesuffix("~copy") not in held
+                         and c[1].removesuffix("~copy") not in avoid
                          and (not c[1].endswith("~copy") or fallback)]
             if cands:
-                if not (over or taken or copy_over or not active or suspect) and not pool_candidate_has_room(
+                if not (over or taken or copy_over or not active or suspect or evicting) and not pool_candidate_has_room(
                         hub, host, cands[0][1], reports, now):
                     return None
                 _, target, why = cands[0]
@@ -3162,7 +3454,7 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     lent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if is_copy:
         os.rename(hub.copy_path(target), lent / f"{target}.copy.{host}.json")
-        copies[target].update(borrower=host, fallback=fallback)
+        copies[target].update(borrower=host, fallback=fallback, lent_at=int(now))
         hub.save_copies(copies)
     else:
         os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
@@ -3262,7 +3554,9 @@ def hub_assign(hub: Hub, host: str, account: str | None, mode: str, force: bool)
         if uuid in hub.desired["draining"]:
             raise AccountError(f"{email} is draining; undrain it first or --force")
         in_pool = hub.desired["policy"].get("pool") and usable_on(reports.get(POOL), uuid)
-        if mode == "pin" and not usable_on(reports.get(host), uuid) and not in_pool:
+        in_copy = (hub.desired["policy"].get("pool")
+                   and available_lend_copy(hub, host, uuid, reports, time.time()))
+        if mode == "pin" and not usable_on(reports.get(host), uuid) and not in_pool and not in_copy:
             raise AccountError(f"{email} has no valid saved login on {host}; it needs /login + capture "
                                "there first (--force to assign anyway)")
     entry = {"account": uuid, "email": email, "mode": mode, "at": int(time.time())}
@@ -3908,9 +4202,11 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
             print(f"skipped: {exc}", file=out)
             return poll_skipped(state, "access token rejected"), None
         except RateLimited as exc:
-            return poll_rate_limited(state, exc, out), None
+            code = poll_rate_limited(state, exc, out)
+            return code, cached_limits_after_poll_failure(state, accounts, state.get("active"))
         except AccountError as exc:
-            return poll_failed(state, str(exc), alert), None
+            code = poll_failed(state, str(exc), alert)
+            return code, cached_limits_after_poll_failure(state, accounts, state.get("active"))
         unsaved = None
         with lock:  # held briefly: alerts may block, so they run after it
             try:
@@ -3934,29 +4230,32 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
         state["active"] = uuid
     record = accounts[uuid]
     reading = (state.get("usage") or {}).get(uuid)
-    interval = (state.get("config") or {}).get("usage_interval_minutes")
-    interval = interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
-    if reading and near_switch_point(state, reading, time.time()):
-        interval = min(interval, NEAR_LIMIT_INTERVAL_SECONDS)  # switches land at 99% (Owner 11-15)
-    if reading and reading.get("limits") and time.time() - reading["at"] < interval:
+    interval = usage_interval_seconds(state)
+    now = time.time()
+    if reading and near_switch_point(state, reading, now, interval, accounts):
+        interval = min(interval, NEAR_LIMIT_INTERVAL_SECONDS)
+    if reading and reading.get("limits") and now - reading["at"] < interval:
         return 0, reading["limits"]  # read recently: spare the endpoint's budget
     # A 429 backoff stops usage reads only: a new login is still noticed above,
     # so the hub never acts on a stale idea of which account is live.
     backoff_until = (state.get("poll") or {}).get("backoff_until", 0)
-    if backoff_until > time.time():
+    if backoff_until > now:
         print(f"skipped: backing off after HTTP 429 for another "
-              f"{(backoff_until - time.time()) / 60:.0f} min", file=out)
-        return 0, None
+              f"{(backoff_until - now) / 60:.0f} min", file=out)
+        return 0, cached_limits_after_poll_failure(state, accounts, uuid, now)
 
     try:
         usage = fetch_usage(login["accessToken"])
     except TokenRejected as exc:
         print(f"skipped: {exc}", file=out)
-        return poll_skipped(state, "access token rejected"), None
+        code = poll_skipped(state, "access token rejected")
+        return code, cached_limits_after_poll_failure(state, accounts, uuid)
     except RateLimited as exc:
-        return poll_rate_limited(state, exc, out), None
+        code = poll_rate_limited(state, exc, out)
+        return code, cached_limits_after_poll_failure(state, accounts, uuid)
     except AccountError as exc:
-        return poll_failed(state, str(exc), alert), None
+        code = poll_failed(state, str(exc), alert)
+        return code, cached_limits_after_poll_failure(state, accounts, uuid)
     limits = parse_limits(usage)
     if not limits:
         return poll_failed(state, "the usage response had no limits this tool understands", alert), None
@@ -3965,8 +4264,14 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
     previous = state.get("poll") or {}
     if previous.get("failures", 0) >= FAILURE_ALERT_AFTER:
         alert(f"usage poll recovered after {previous['failures']} failures")
+    if isinstance(reading, dict) and reading.get("limits") and reading.get("at", 0) < now:
+        state.setdefault("usage_previous", {})[uuid] = {
+            "at": reading["at"],
+            "limits": [dict(limit) for limit in reading["limits"] if isinstance(limit, dict)],
+        }
     state.setdefault("usage", {})[uuid] = {"at": now, "limits": limits}
     state["poll"] = {"at": now, "ok": True, "account": uuid}
+    state.pop("rate_limit_signal_at", None)
 
     # Sessions rewrite ~/.claude.json and can restore a stale profile.
     try:
@@ -3988,18 +4293,20 @@ def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[di
     uuid = state["active"]
     record = accounts[uuid]
     advice = None
-    threshold_config = config
+    threshold_config = usage_threshold_config(state, uuid, accounts)
     if mode == "auto" and pool_on(state):
         policy = (last_hub_reply(state) or {}).get("policy") or {}
-        if policy:
-            threshold_config = {**config}
-            if "thresholds" in policy:
-                threshold_config["thresholds"] = policy["thresholds"]
-            if "switch_on_scoped" in policy:
-                threshold_config["switch_on_scoped"] = (
-                    policy["switch_on_scoped"]
-                    and host_name(state) not in set(policy.get("leftover_hosts") or []))
-    over = over_threshold(limits, threshold_config, now, for_switch=True)
+        if policy.get("switch_on_scoped") is not None:
+            threshold_config["switch_on_scoped"] = (
+                policy["switch_on_scoped"]
+                and host_name(state) not in set(policy.get("leftover_hosts") or []))
+    reading = (state.get("usage") or {}).get(uuid) or {"at": now, "limits": limits}
+    previous = (state.get("usage_previous") or {}).get(uuid)
+    signal_at = state.get("rate_limit_signal_at")
+    failed = ((state.get("poll") or {}).get("ok") is False
+              or (isinstance(signal_at, (int, float)) and now - signal_at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS))
+    over = usage_risk_limits(reading, previous, threshold_config, now,
+                             horizon=usage_interval_seconds(state), failed=failed)
     if mode == "pin":
         advice = "Pinned by the coordinator; it decides any switch"
     elif mode == "auto" and pool_on(state) and over:
@@ -4304,6 +4611,7 @@ def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
             # The file now holds the target's tokens: record that before
             # anything else can fail, or the next refresh is misattributed.
             state["active"] = target
+            state.pop("rate_limit_signal_at", None)
             record_history(state, "switch", account=target, previous=current, identified_by=how)
         persist_state(paths, state)
         if time.monotonic() - lock.acquired_at > MAX_HOLD_SECONDS:

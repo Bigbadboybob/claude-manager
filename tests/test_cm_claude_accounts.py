@@ -868,6 +868,28 @@ class AutoswitchHarness(PollHarness):
 class AutoswitchTests(AutoswitchHarness):
     """On threshold: suggest the account with most room; auto switches behind a flag."""
 
+    def test_429_after_a_fast_burn_reading_still_switches(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 2 * 86400, True), autoswitch="auto")
+        state = self.state()
+        state["config"] = {"autoswitch": "auto", "usage_interval_minutes": 9,
+                            "thresholds": {"session": 98, "weekly": 98}}
+        now = int(time.time())
+        previous = {"at": now - 600,
+                    "limits": accounts.parse_limits(usage(("session", None, 80, 3600, True)))}
+        reading = {"at": now - 600,
+                   "limits": accounts.parse_limits(usage(("session", None, 90, 3600, True)))}
+        state["usage"]["alice-uuid-0000"] = reading
+        state["usage_previous"] = {"alice-uuid-0000": previous}
+        state["poll"] = {"at": now - 600, "ok": True}
+        for event in state["history"]:
+            if event.get("event") == "switch":
+                event["at"] -= 3600
+        self.paths.state.write_text(json.dumps(state))
+        self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live_email(), "bob@example.com")
+
     def test_suggests_the_account_with_most_room(self):
         self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True))
         self.age_last_switch(31 * 60)  # so only the mode keeps it from switching
@@ -1660,6 +1682,45 @@ class PoolTests(HubHarness):
             export["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"] = 98
             self.assertTrue(bool(accounts.pool_lend(h, "laptop", export, reports, now, previous)))
 
+    def test_failed_429_near_limit_checkin_lends_before_the_next_reading(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.hub("policy", "thresholds.session", "98")
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True), hub="cm-manager",
+                         host_name="laptop")
+        self.poll()
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("session", None, 90, 3600, True)))
+        export.update(last_switch_at=now - 3600,
+                      poll={"at": now, "ok": False, "reason": "usage requests are rate limited (HTTP 429)"})
+        with accounts.Hub(self.hub_paths) as h:
+            reply = accounts.hub_checkin(h, export)
+        self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "bob-uuid-0000")
+
+    def test_pending_copy_eviction_can_lend_a_replacement(self):
+        self.prepare_projection_pool()
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("weekly_all", None, 99, 86400, True)))
+        export.update(last_switch_at=now - 3600, auto_switches_24h=0)
+        with accounts.Hub(self.hub_paths) as h:
+            export["active"] = "bob-uuid-0000"
+            export["accounts"]["bob-uuid-0000"] = export["accounts"].pop("alice-uuid-0000")
+            export["accounts"]["bob-uuid-0000"]["email"] = "bob@example.com"
+            copies = h.copies()
+            copies["bob-uuid-0000"] = {"borrower": "laptop", "evicting": True,
+                                        "fallback": "alice-uuid-0000", "lent_at": now - 60}
+            h.save_copies(copies)
+            carol = h.pool().get("carol-uuid-0000")
+            self.assertIsNotNone(carol)
+            accounts.atomic_write(h.dir / "readings.json", {
+                "carol-uuid-0000": {"at": now, "limits": accounts.parse_limits(
+                    usage(("weekly_all", None, 10, 86400, True)))}})
+            reply = accounts.hub_checkin(h, export)
+        self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "carol-uuid-0000")
+
     def test_projection_refuses_an_unread_target_even_when_policy_allows_it(self):
         self.prepare_projection_pool()
         self.hub("policy", "auto_allow_unread", "true")
@@ -1930,6 +1991,32 @@ class LendCopyTests(HubHarness):
         self.assertIn("lend copy", self.hub("status")[1])
         self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
 
+    def test_pin_assigns_an_available_lend_copy(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        self.other_host(self.borrower_export())
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["reservations"].pop("bob-uuid-0000", None)
+            h.save()
+            message = accounts.hub_assign(h, "borrower", "bob@example.com", "pin", False)
+            self.assertIn("pin bob@example.com", message)
+            reply = accounts.hub_checkin(h, self.borrower_export())
+        self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "bob-uuid-0000")
+
+    def test_missing_borrower_reading_waits_for_a_post_lend_lender_cap(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        borrower = self.borrower_export("bob", ["bob"])
+        borrower["accounts"]["bob-uuid-0000"]["reading"] = None
+        with accounts.Hub(self.hub_paths) as h:
+            reports = h.reports()
+            self.assertIsNone(accounts.borrowed_copy_over_cap(h, "borrower", borrower, reports, time.time()))
+            lender = self.remote_holder(accounts.login_fingerprint(self.primary), week=80, age=0)
+            reports["holder"] = {"at": int(time.time()), "export": lender}
+            self.assertEqual(accounts.borrowed_copy_over_cap(h, "borrower", borrower, reports,
+                                                             time.time()), "bob-uuid-0000")
+
     def remote_holder(self, fingerprint=None, week=20, session=30, age=0):
         exp = host_export("holder", active="bob", saved=["bob"],
                           bob=(age, ("weekly_all", None, week, 86400, True),
@@ -1971,7 +2058,7 @@ class LendCopyTests(HubHarness):
                                  accounts.pool_candidates(h, "holder", h.reports(), time.time())))
         self.assertIn("lend", self.lend(self.borrower_export()))
         # A newer borrower reading cannot conceal the holder's recent cap.
-        holder = self.remote_holder(accounts.login_fingerprint(self.primary), week=80, age=1)
+        holder = self.remote_holder(accounts.login_fingerprint(self.primary), week=80, age=0)
         self.other_host(holder)
         borrower = self.borrower_export("bob", ["bob"], week=20)
         reply = self.lend(borrower)
@@ -2032,7 +2119,7 @@ class LendCopyTests(HubHarness):
                                  accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
         self.assertNotIn("lend", self.lend(self.borrower_export()))
 
-    def test_borrower_without_weekly_reading_is_evicted(self):
+    def test_borrower_without_weekly_reading_is_not_evicted(self):
         self.use_remote_holder(accounts.login_fingerprint(self.primary))
         self.import_copy()
         self.assertIn("lend", self.lend(self.borrower_export()))
@@ -2040,7 +2127,9 @@ class LendCopyTests(HubHarness):
         borrower["accounts"]["bob-uuid-0000"]["reading"]["limits"] = accounts.parse_limits(
             usage(("weekly_scoped", "opus", 20, 86400, False)))
         reply = self.lend(borrower)
-        self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+        self.assertEqual((reply.get("entry") or {}).get("mode"), "auto")
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.copies()["bob-uuid-0000"]["borrower"], "borrower")
 
     def test_holder_fingerprint_conflict_blocks_copy_and_records_event(self):
         self.use_remote_holder(accounts.login_fingerprint(self.primary))
@@ -2335,31 +2424,15 @@ class LendCopyTests(HubHarness):
             self.assertEqual(h.desired["hosts"]["borrower"]["account"], "bob-uuid-0000")
             self.assertTrue(h.copy_path("bob-uuid-0000").exists())
 
-    def test_missing_and_stale_borrower_readings_evict_without_pool(self):
+    def test_missing_borrower_reading_does_not_evict(self):
         self.import_copy()
-        for reading_kind in ("missing", "stale"):
-            with self.subTest(reading_kind=reading_kind):
-                self.assertIn("lend", self.lend(self.borrower_export()))
-                exp = self.borrower_export("bob", ["bob"])
-                if reading_kind == "missing":
-                    exp["accounts"]["bob-uuid-0000"]["reading"] = None
-                else:
-                    exp["accounts"]["bob-uuid-0000"]["reading"]["at"] -= 4 * 3600
-                reply = self.lend(exp)
-                self.assertEqual(reply["entry"]["mode"], "pin")
-                self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
-                self.assertNotIn("lend", reply)
-                exp = self.borrower_export("alice", ["bob", "alice"])
-                exp["returning"] = {"bob-uuid-0000": self.copy}
-                reply = self.lend(exp)
-                self.assertIn("bob-uuid-0000", reply["returned"])
-                with accounts.Hub(self.hub_paths) as h:
-                    self.assertFalse(any(c[1].endswith("~copy") for c in
-                                         accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
-                    copies = h.copies()
-                    copies["bob-uuid-0000"]["blocked_at"] = int(time.time()) - 1
-                    h.save_copies(copies)
-                self.manager_reading(20, 30)
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        exp = self.borrower_export("bob", ["bob"])
+        exp["accounts"]["bob-uuid-0000"]["reading"] = None
+        reply = self.lend(exp)
+        self.assertEqual((reply.get("entry") or {}).get("mode"), "auto")
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.copies()["bob-uuid-0000"]["borrower"], "borrower")
 
     def test_lost_return_ack_cannot_replace_primary(self):
         self.import_copy()
@@ -2709,6 +2782,23 @@ class HubTests(HubHarness):
 
 
 class UsageIntervalTests(HubHarness):
+    def test_projection_and_failed_reading_mark_a_fast_burn_account_over(self):
+        now = int(time.time())
+        previous = {"at": now - 600,
+                    "limits": accounts.parse_limits(usage(("session", None, 80, 3600, True)))}
+        reading = {"at": now,
+                   "limits": accounts.parse_limits(usage(("session", None, 90, 3600, True)))}
+        reading["limits"][0]["resets_at"] = previous["limits"][0]["resets_at"]
+        config = {"thresholds": {"session": 98, "weekly": 98}}
+        projected = accounts.projected_limits(reading, previous, config, now)
+        self.assertEqual(projected[0][1], 100)
+        risk = accounts.usage_risk_limits(reading, None, config, now, horizon=540, failed=True)
+        self.assertEqual(risk[0]["percent"], 98)
+        state = {"active": "alice-uuid-0000", "usage": {"alice-uuid-0000": reading},
+                 "usage_previous": {"alice-uuid-0000": previous},
+                 "config": {"thresholds": {"session": 98, "weekly": 98}}}
+        self.assertTrue(accounts.near_switch_point(state, reading, now, 540))
+
     def test_usage_is_read_at_most_once_per_interval_while_check_ins_continue(self):
         with mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 9 * 60):
             self.poll()
