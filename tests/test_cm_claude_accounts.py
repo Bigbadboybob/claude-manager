@@ -1695,9 +1695,23 @@ class PoolTests(HubHarness):
                              alice=(0, ("session", None, 90, 3600, True)))
         export.update(last_switch_at=now - 3600,
                       poll={"at": now, "ok": False, "reason": "usage requests are rate limited (HTTP 429)"})
-        with accounts.Hub(self.hub_paths) as h:
-            reply = accounts.hub_checkin(h, export)
+        with mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 9 * 60):
+            with accounts.Hub(self.hub_paths) as h:
+                reply = accounts.hub_checkin(h, export)
         self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "bob-uuid-0000")
+
+    def test_hub_failed_poll_uses_the_cached_reading_age(self):
+        self.prepare_projection_pool()
+        now = int(time.time())
+        with mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 9 * 60):
+            for percent, age, expected in ((80, 30 * 60, True), (50, 10 * 60, False)):
+                export = host_export("laptop", active="alice", saved=["alice"],
+                                     alice=(age, ("session", None, percent, 5 * 3600, True)))
+                export.update(last_switch_at=now - 3600,
+                              poll={"at": now, "ok": False, "reason": "usage request failed (HTTP 500)"})
+                with accounts.Hub(self.hub_paths) as h:
+                    lend = accounts.pool_lend(h, "laptop", export, h.reports(), now)
+                self.assertEqual(bool(lend), expected)
 
     def test_pending_copy_eviction_can_lend_a_replacement(self):
         self.prepare_projection_pool()

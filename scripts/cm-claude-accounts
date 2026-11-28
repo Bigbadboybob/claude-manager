@@ -3301,7 +3301,10 @@ def usage_failure_limits(export: dict, previous: dict | None, config: dict,
     old = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") \
         if (previous or {}).get("active") == active else None
     failed = (export.get("poll") or {}).get("ok") is False
-    limits = (usage_risk_limits(reading, old, config, now, failed=True)
+    limits = (usage_risk_limits(
+                  reading, old, config, now,
+                  horizon=failed_projection_horizon(reading, now, USAGE_INTERVAL_SECONDS),
+                  failed=True)
               if failed else over_threshold((reading or {}).get("limits") or [], config, now,
                                             for_switch=True))
     if limits:
