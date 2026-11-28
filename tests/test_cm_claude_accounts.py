@@ -2203,6 +2203,22 @@ class LendCopyTests(HubHarness):
             self.assertFalse(any(c[1].endswith("~copy") for c in accounts.pool_candidates(h, "cm-manager", h.reports(), time.time())))
         self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
 
+    def test_low_room_pool_account_ranks_after_lend_copies(self):
+        # 11-28 12:29Z: a 97% 5h account ranked ahead of a copy with room.
+        self.import_copy()
+        carol = json.loads((self.paths.accounts / "carol-uuid-0000.json").read_text())
+        with accounts.Hub(self.hub_paths) as h:
+            h.pool_put(carol)
+            # Test default session threshold is 80: 75% lasts ~5 min, 50% ~30 min.
+            for pct, expected in ((75, ["bob-uuid-0000~copy", "carol-uuid-0000"]),
+                                  (50, ["carol-uuid-0000", "bob-uuid-0000~copy"])):
+                with self.subTest(session=pct):
+                    accounts.atomic_write(h.dir / "readings.json", {"carol-uuid-0000": {"at": int(time.time()),
+                        "limits": accounts.parse_limits(usage(("session", None, pct, 3600, True),
+                                                              ("weekly_all", None, 20, 86400, True)))}})
+                    candidates = accounts.pool_candidates(h, "borrower", h.reports(), time.time())
+                    self.assertEqual([c[1] for c in candidates], expected)
+
     def test_caps_switch_and_return_to_copy_slot(self):
         for week, session in ((80, 30), (20, 60)):
             with self.subTest(week=week, session=session):

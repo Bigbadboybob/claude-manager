@@ -2982,6 +2982,20 @@ def copy_conflict_hosts(uuid: str, meta: dict, reports: dict[str, dict]) -> list
                   and host_accounts(report)[uuid].get("login_fingerprint") == fp)
 
 
+POOL_BRIDGE_MIN_MINUTES = 15
+
+
+def pool_bridge_too_short(limits: list[dict], config: dict) -> bool:
+    """True when some counted limit runs out within POOL_BRIDGE_MIN_MINUTES
+    at the default burn rate (15 min = 15% of a 5h limit, ~4% of a week)."""
+    for limit in limits:
+        family = "session" if limit.get("kind") == "session" else "weekly"
+        room = threshold_for(limit, config) - limit.get("percent", 0)
+        if room * 60 / DEFAULT_BURN_RATE_PER_HOUR[family] < POOL_BRIDGE_MIN_MINUTES:
+            return True
+    return False
+
+
 def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -> list[tuple]:
     """Pool accounts this host may borrow, best first: not draining, not
     reserved for others (a last-resort reservation ranks last), with room."""
@@ -3052,7 +3066,13 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
                 if reading else 100.0
             order = (room < min_lend_room, resets)
         # Room tier first, then the host's reservation within that tier.
-        out.append(((last_resort, 0, order[0], not mine, *order[1:], ratio,
+        # An account that would last under POOL_BRIDGE_MIN_MINUTES at the
+        # default burn rate ranks after the lend copies too: a near-empty
+        # bridge stalls the host minutes later (11-28 05:01Z, and a 97% 5h
+        # bender0 nearly took cm-sessions at 12:29Z).
+        tier = (True, 2) if not leftover and reading and pool_bridge_too_short(counted, config) \
+            else (last_resort, 0)
+        out.append(((*tier, order[0], not mine, *order[1:], ratio,
                      email or uuid), uuid, why))
     # Lend copies are a separate last tier, even after last-resort reservations.
     for uuid, meta in hub.copies().items():
