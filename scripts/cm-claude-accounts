@@ -1417,6 +1417,8 @@ NEAR_LIMIT_PERCENT = 95
 NEAR_LIMIT_INTERVAL_SECONDS = 170  # every other 2-min timer run: ~0.7% at 10%/h
 USAGE_RISK_MARGIN_PERCENT = 2.0
 DEFAULT_BURN_RATE_PER_HOUR = {"session": 60.0, "weekly": 15.0}
+RATE_LIMIT_SIGNAL_LOOKBACK_SECONDS = 15 * 60
+MAX_FAILED_PROJECTION_SECONDS = 2 * 3600
 
 
 def conservative_projection(limit: dict, horizon: float) -> float | None:
@@ -1430,6 +1432,13 @@ def conservative_projection(limit: dict, horizon: float) -> float | None:
 def usage_interval_seconds(state: dict) -> float:
     interval = (state.get("config") or {}).get("usage_interval_minutes")
     return interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
+
+
+def failed_projection_horizon(reading: dict | None, now: float, interval: float) -> float:
+    """Project from the time a failed-poll reading was actually taken."""
+    at = reading.get("at") if isinstance(reading, dict) else None
+    age = max(0.0, now - at) if isinstance(at, (int, float)) else 0.0
+    return min(MAX_FAILED_PROJECTION_SECONDS, age + max(0.0, interval))
 
 
 def usage_threshold_config(state: dict, uuid: str | None = None,
@@ -1451,10 +1460,12 @@ def usage_threshold_config(state: dict, uuid: str | None = None,
 
 
 def projected_usage(reading: dict | None, previous: dict | None, config: dict,
-                    now: float, horizon: float = 900) -> list[tuple[dict, float]]:
+                    now: float, horizon: float = 900,
+                    extrapolate: bool = False) -> list[tuple[dict, float]]:
     if not isinstance(reading, dict) or not isinstance(previous, dict):
         return []
-    return projected_limits(reading, previous, config, now, horizon=horizon)
+    return projected_limits(reading, previous, config, now, horizon=horizon,
+                            extrapolate=extrapolate)
 
 
 def usage_risk_limits(reading: dict | None, previous: dict | None, config: dict,
@@ -1471,7 +1482,8 @@ def usage_risk_limits(reading: dict | None, previous: dict | None, config: dict,
     def key(limit: dict) -> tuple:
         return limit.get("kind"), limit.get("scope"), limit.get("group")
     out_keys = {key(limit) for limit in out}
-    projected = projected_usage(reading, previous, config, now, horizon=horizon)
+    projected = projected_usage(reading, previous, config, now, horizon=horizon,
+                                extrapolate=failed)
     projected_keys = {(l.get("kind"), l.get("scope"), l.get("group")) for l, _ in projected}
     if failed:
         for limit in limits:
@@ -1481,7 +1493,11 @@ def usage_risk_limits(reading: dict | None, previous: dict | None, config: dict,
                 continue
             limit_key = (limit.get("kind"), limit.get("scope"), limit.get("group"))
             if limit_key not in projected_keys:
-                value = conservative_projection(limit, horizon)
+                limit_horizon = horizon
+                reset = limit.get("resets_at")
+                if isinstance(reset, (int, float)):
+                    limit_horizon = min(limit_horizon, max(0.0, reset - now))
+                value = conservative_projection(limit, limit_horizon)
                 if value is not None and value >= threshold_for(limit, config):
                     projected.append((limit, value))
     for limit, value in projected:
@@ -1836,7 +1852,8 @@ def export_view(paths: Paths, state: dict) -> dict:
             "last_switch_at": last_switch_at(state),
             "auto_switches_24h": auto_switches_since(state, now - 86400),
             "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll},
-            "rate_limit_signal_at": state.get("rate_limit_signal_at")}
+            "rate_limit_signal_at": state.get("rate_limit_signal_at"),
+            "rate_limit_signal_account": state.get("rate_limit_signal_account")}
 
 
 def fetch_peer(host: str) -> dict:
@@ -1983,8 +2000,9 @@ def cached_limits_after_poll_failure(state: dict, accounts: dict[str, dict], uui
     now = time.time() if now is None else now
     config = usage_threshold_config(state, uuid, accounts)
     previous = (state.get("usage_previous") or {}).get(uuid)
+    interval = usage_interval_seconds(state)
     if usage_risk_limits(reading, previous, config, now,
-                         horizon=usage_interval_seconds(state), failed=True):
+                         horizon=failed_projection_horizon(reading, now, interval), failed=True):
         return reading["limits"]
     return None
 
@@ -2121,8 +2139,11 @@ def sweep(paths: Paths, state: dict, out, alert, alert_owner) -> None:
             done[key] = now
             owner.append(f"{name} ({error})")
             continue
-        if error == "rate_limit":
-            state["rate_limit_signal_at"] = int(now)
+        if error == "rate_limit" and at >= switched:
+            switch = next((h for h in reversed(state.get("history", []))
+                           if h.get("event") == "switch" and h.get("at") == switched), None)
+            state["rate_limit_signal_at"] = at
+            state["rate_limit_signal_account"] = (switch or {}).get("account") or state.get("active")
         if len(prompted) >= SWEEP_MAX_PER_RUN:
             break
         try:
@@ -3110,7 +3131,6 @@ def lend_copy_over_cap(reading: dict | None, caps: dict | None, now: float) -> b
             or reading["at"] > now:
         return False
     limits = {l.get("kind"): l for l in reading.get("limits", []) if isinstance(l, dict)}
-    checked = False
     for kind, key in (("weekly_all", "week"), ("session", "five_hour")):
         cap = caps.get(key)
         if not isinstance(cap, (int, float)):
@@ -3121,10 +3141,9 @@ def lend_copy_over_cap(reading: dict | None, caps: dict | None, now: float) -> b
         if not isinstance(limit, dict):
             return False
         if limit.get("resets_at") is None or limit["resets_at"] > now:
-            checked = True
             if isinstance(limit.get("percent"), (int, float)) and limit["percent"] >= cap:
                 return True
-    return False if checked else False
+    return False
 
 
 def lend_copy_bound_over_cap(reading: dict | None, caps: dict | None,
@@ -3197,7 +3216,7 @@ def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
     cached = load_json(hub.dir / "readings.json").get(active)
     if isinstance(cached, dict) and cached.get("host") not in (None, host) \
             and cached.get("at", 0) >= lent_at \
-            and lend_copy_over_cap(cached, caps, now) and cached.get("at", 0) >= lent_at:
+            and lend_copy_over_cap(cached, caps, now):
         return active
     if isinstance(cached, dict) and cached.get("host") not in (None, host) \
             and cached.get("at", 0) >= lent_at \
@@ -3207,7 +3226,7 @@ def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
 
 
 def projected_limits(reading: dict, previous: dict, config: dict, now: float,
-                     horizon: float = 900) -> list[tuple[dict, float]]:
+                     horizon: float = 900, extrapolate: bool = False) -> list[tuple[dict, float]]:
     """Project one observed reading interval ahead, only within a known reset window."""
     at, old_at = reading.get("at"), previous.get("at")
     if not (isinstance(at, (int, float)) and isinstance(old_at, (int, float))
@@ -3230,7 +3249,10 @@ def projected_limits(reading: dict, previous: dict, config: dict, now: float,
                 and isinstance(percent, (int, float))
                 and isinstance(old_percent, (int, float)) and percent >= old_percent):
             continue
-        projected = percent + (percent - old_percent) * min(max(0, horizon), at - old_at) / (at - old_at)
+        lookahead = min(max(0, horizon), max(0, reset - now))
+        if not extrapolate:
+            lookahead = min(lookahead, at - old_at)
+        projected = percent + (percent - old_percent) * lookahead / (at - old_at)
         if projected >= threshold_for(limit, config):
             result.append((limit, projected))
     return result
@@ -3263,17 +3285,11 @@ def pool_candidate_has_room(hub: Hub, host: str, candidate: str,
 
 
 def host_rate_limit_signal(export: dict, now: float) -> bool:
-    """A sweep's rate_limit errors are direct evidence the active login is full."""
+    """A recent, account-attributed post-switch rate_limit is evidence of a full login."""
     signal_at = export.get("rate_limit_signal_at")
-    if isinstance(signal_at, (int, float)) and now - signal_at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS:
-        return True
-    for event in export.get("events") or []:
-        if not isinstance(event, dict) or "rate_limit" not in str(event.get("message", "")):
-            continue
-        at = event.get("at")
-        if not isinstance(at, (int, float)) or now - at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS:
-            return True
-    return False
+    return (isinstance(signal_at, (int, float))
+            and export.get("rate_limit_signal_account") == export.get("active")
+            and 0 <= now - signal_at <= RATE_LIMIT_SIGNAL_LOOKBACK_SECONDS)
 
 
 def usage_failure_limits(export: dict, previous: dict | None, config: dict,
@@ -4272,6 +4288,7 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
     state.setdefault("usage", {})[uuid] = {"at": now, "limits": limits}
     state["poll"] = {"at": now, "ok": True, "account": uuid}
     state.pop("rate_limit_signal_at", None)
+    state.pop("rate_limit_signal_account", None)
 
     # Sessions rewrite ~/.claude.json and can restore a stale profile.
     try:
@@ -4303,10 +4320,14 @@ def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[di
     reading = (state.get("usage") or {}).get(uuid) or {"at": now, "limits": limits}
     previous = (state.get("usage_previous") or {}).get(uuid)
     signal_at = state.get("rate_limit_signal_at")
-    failed = ((state.get("poll") or {}).get("ok") is False
-              or (isinstance(signal_at, (int, float)) and now - signal_at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS))
+    signal_live = (isinstance(signal_at, (int, float))
+                   and state.get("rate_limit_signal_account") == uuid
+                   and 0 <= now - signal_at <= RATE_LIMIT_SIGNAL_LOOKBACK_SECONDS)
+    failed = (state.get("poll") or {}).get("ok") is False or signal_live
+    interval = usage_interval_seconds(state)
+    horizon = failed_projection_horizon(reading, now, interval) if failed else interval
     over = usage_risk_limits(reading, previous, threshold_config, now,
-                             horizon=usage_interval_seconds(state), failed=failed)
+                             horizon=horizon, failed=failed)
     if mode == "pin":
         advice = "Pinned by the coordinator; it decides any switch"
     elif mode == "auto" and pool_on(state) and over:
@@ -4612,6 +4633,7 @@ def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
             # anything else can fail, or the next refresh is misattributed.
             state["active"] = target
             state.pop("rate_limit_signal_at", None)
+            state.pop("rate_limit_signal_account", None)
             record_history(state, "switch", account=target, previous=current, identified_by=how)
         persist_state(paths, state)
         if time.monotonic() - lock.acquired_at > MAX_HOLD_SECONDS:

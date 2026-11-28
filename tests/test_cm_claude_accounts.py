@@ -2782,6 +2782,59 @@ class HubTests(HubHarness):
 
 
 class UsageIntervalTests(HubHarness):
+    def test_pre_switch_rate_limit_sweep_signal_cannot_switch_the_new_account(self):
+        now = int(time.time())
+        state = self.state()
+        state["config"] = {"autoswitch": "auto", "usage_interval_minutes": 9,
+                            "thresholds": {"session": 98, "weekly": 98}}
+        state["active"] = "alice-uuid-0000"
+        state["usage"] = {
+            "alice-uuid-0000": {"at": now, "limits": accounts.parse_limits(
+                usage(("session", None, 90, 3600, True)))},
+            "bob-uuid-0000": {"at": now, "limits": accounts.parse_limits(
+                usage(("session", None, 10, 3600, True)))}}
+        state["history"] = [{"at": now - 3600, "event": "switch",
+                              "account": "alice-uuid-0000", "previous": "bob-uuid-0000"}]
+        state["rate_limit_signal_at"] = now - 1
+        state["rate_limit_signal_account"] = "bob-uuid-0000"
+        self.paths.state.write_text(json.dumps(state))
+        with mock.patch.object(accounts, "cmd_switch") as switch:
+            accounts.decide(self.paths, state, accounts.load_accounts(self.paths),
+                            state["usage"]["alice-uuid-0000"]["limits"], "auto",
+                            io.StringIO(), lambda message: None)
+        switch.assert_not_called()
+
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("session", None, 90, 3600, True)))
+        export["rate_limit_signal_at"] = now - 1
+        export["rate_limit_signal_account"] = "bob-uuid-0000"
+        export["events"] = [{"message": "rate_limit"}]
+        config = {"thresholds": {"session": 98, "weekly": 98}}
+        self.assertEqual(accounts.usage_failure_limits(export, None, config, now), [])
+
+    def test_failed_poll_projection_includes_the_cached_reading_age(self):
+        now = int(time.time())
+        config = {"thresholds": {"session": 98, "weekly": 98}}
+        old = {"at": now - 30 * 60,
+               "limits": accounts.parse_limits(usage(("session", None, 80, 5 * 3600, True)))}
+        horizon = accounts.failed_projection_horizon(old, now, 9 * 60)
+        self.assertEqual(horizon, 39 * 60)
+        self.assertTrue(accounts.usage_risk_limits(old, None, config, now,
+                                                   horizon=horizon, failed=True))
+        fresh = {"at": now - 10 * 60,
+                 "limits": accounts.parse_limits(usage(("session", None, 50, 5 * 3600, True)))}
+        horizon = accounts.failed_projection_horizon(fresh, now, 9 * 60)
+        self.assertFalse(accounts.usage_risk_limits(fresh, None, config, now,
+                                                    horizon=horizon, failed=True))
+        previous = {"at": now - 40 * 60,
+                    "limits": accounts.parse_limits(usage(("weekly_all", None, 70, 5 * 86400, True)))}
+        observed = {"at": now - 30 * 60,
+                    "limits": accounts.parse_limits(usage(("weekly_all", None, 80, 5 * 86400, True)))}
+        observed["limits"][0]["resets_at"] = previous["limits"][0]["resets_at"]
+        horizon = accounts.failed_projection_horizon(observed, now, 9 * 60)
+        self.assertTrue(accounts.usage_risk_limits(observed, previous, config, now,
+                                                   horizon=horizon, failed=True))
+
     def test_projection_and_failed_reading_mark_a_fast_burn_account_over(self):
         now = int(time.time())
         previous = {"at": now - 600,
